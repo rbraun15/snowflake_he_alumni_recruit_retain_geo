@@ -1,0 +1,1890 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+import pydeck as pdk
+from snowflake.snowpark.context import get_active_session
+from snowflake.snowpark.functions import col, sum, count, avg, round
+import warnings
+warnings.filterwarnings('ignore')
+
+# Page configuration
+st.set_page_config(
+    page_title="Higher Ed Alumni Recruitment & Retention",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        color: #1f4e79;
+        text-align: center;
+        font-weight: bold;
+        margin-bottom: 2rem;
+    }
+    .sub-header {
+        font-size: 1.5rem;
+        color: #2e86ab;
+        font-weight: bold;
+        margin-bottom: 1rem;
+    }
+    .metric-container {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f4e79;
+    }
+    .filter-section {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .matching-card {
+        background-color: #ffffff;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #dee2e6;
+        margin-bottom: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Get Snowflake session
+@st.cache_resource
+def get_snowflake_session():
+    """Get the active Snowflake session"""
+    return get_active_session()
+
+session = get_snowflake_session()
+
+# Data loading functions using Snowpark
+@st.cache_data(ttl=600)
+def load_alumni_data():
+    """Load alumni donor data using Snowpark"""
+    df = session.table("HIGHER_ED_DEMO.ALUMNI_TARGETING.ALUMNI_DONORS").to_pandas()
+    return df
+
+@st.cache_data(ttl=600)
+def load_student_data():
+    """Load student data using Snowpark"""
+    df = session.table("HIGHER_ED_DEMO.STUDENT.STUDENT").to_pandas()
+    return df
+
+def apply_alumni_filters(df, zip_codes, majors, grad_years, donation_range):
+    """Apply filters to the alumni dataframe with dynamic filtering"""
+    filtered_df = df.copy()
+    
+    if zip_codes:
+        filtered_df = filtered_df[filtered_df['ZIP_CODE'].isin(zip_codes)]
+    
+    if majors:
+        filtered_df = filtered_df[filtered_df['MAJOR'].isin(majors)]
+    
+    if grad_years:
+        filtered_df = filtered_df[
+            (filtered_df['GRADUATION_YEAR'] >= grad_years[0]) & 
+            (filtered_df['GRADUATION_YEAR'] <= grad_years[1])
+        ]
+    
+    if donation_range:
+        filtered_df = filtered_df[
+            (filtered_df['ANNUAL_DONATION_AMOUNT'] >= donation_range[0]) & 
+            (filtered_df['ANNUAL_DONATION_AMOUNT'] <= donation_range[1])
+        ]
+    
+    return filtered_df
+
+def apply_student_filters(df, zip_codes, majors, student_status):
+    """Apply filters to the student dataframe"""
+    filtered_df = df.copy()
+    
+    if zip_codes:
+        filtered_df = filtered_df[filtered_df['ZIP_CODE'].isin(zip_codes)]
+    
+    if majors:
+        filtered_df = filtered_df[filtered_df['MAJOR'].isin(majors)]
+        
+    if student_status:
+        filtered_df = filtered_df[filtered_df['STUDENT_STATUS'].isin(student_status)]
+    
+    return filtered_df
+
+def get_dynamic_filter_options(df, selected_zips=None, selected_majors=None):
+    """Get dynamic filter options based on current selections"""
+    temp_df = df.copy()
+    
+    # Apply zip filter first if selected
+    if selected_zips:
+        temp_df = temp_df[temp_df['ZIP_CODE'].isin(selected_zips)]
+    
+    # Apply major filter if selected
+    if selected_majors:
+        temp_df = temp_df[temp_df['MAJOR'].isin(selected_majors)]
+    
+    # Return available options (filter out null values)
+    available_zips = sorted([z for z in temp_df['ZIP_CODE'].unique() if z is not None and pd.notna(z)]) if not temp_df.empty else []
+    available_majors = sorted([m for m in temp_df['MAJOR'].unique() if m is not None and pd.notna(m)]) if not temp_df.empty else []
+    
+    return available_zips, available_majors
+
+def create_h3_hexagon_map_pydeck(df, resolution):
+    """Create true H3 hexagon map using PyDeck H3HexagonLayer - EXACT copy from working donor_targeting.strm"""
+    h3_column = f'H3_LEVEL_{resolution}'
+    
+    # Check if H3 column exists in dataframe
+    if h3_column not in df.columns:
+        st.warning(f"H3 column {h3_column} not found in data. Creating H3 indices on-the-fly...")
+        return None  # Skip on-the-fly calculation for now
+    
+    # Aggregate data by H3 cell
+    if 'ANNUAL_DONATION_AMOUNT' in df.columns:
+        # Alumni data with donations
+        h3_agg = df.groupby(h3_column).agg({
+            'ANNUAL_DONATION_AMOUNT': ['sum', 'mean', 'count'],
+            'CUMULATIVE_DONATION_AMOUNT': 'sum',
+            'LATITUDE': 'mean',
+            'LONGITUDE': 'mean'
+        }).round(2)
+        
+        h3_agg.columns = ['total_annual', 'avg_annual', 'donor_count', 'total_cumulative', 'center_lat', 'center_lon']
+        h3_agg = h3_agg.reset_index()
+    else:
+        # Student data without donations
+        h3_agg = df.groupby(h3_column).agg({
+            'LATITUDE': ['mean', 'count'],
+            'LONGITUDE': 'mean'
+        }).round(2)
+        
+        h3_agg.columns = ['center_lat', 'donor_count', 'center_lon'] 
+        h3_agg = h3_agg.reset_index()
+        # For students, use count as the value
+        h3_agg['total_annual'] = h3_agg['donor_count']
+        h3_agg['avg_annual'] = h3_agg['donor_count']
+        h3_agg['total_cumulative'] = h3_agg['donor_count']
+    
+    # Check if we have valid aggregated data
+    if h3_agg.empty:
+        st.error("❌ No H3 aggregated data available")
+        return create_simple_scatter_map(df)
+    
+    st.success(f"✅ Creating H3 hexagons for {len(h3_agg)} spatial clusters!")
+    
+    # Calculate map center
+    avg_latitude = h3_agg['center_lat'].mean()
+    avg_longitude = h3_agg['center_lon'].mean()
+    
+    # Define color function based on total annual donations (following user's example)
+    def get_color_for_donations(donation_amount, max_donation):
+        # Normalize to 0-1 range
+        normalized = min(1.0, max(0.0, donation_amount / max_donation)) if max_donation > 0 else 0
+        
+        # Color scale from light orange to dark red
+        red = int(255 * (0.8 + 0.2 * normalized))  # 204-255
+        green = int(255 * (0.6 * (1 - normalized)))  # 153 down to 0
+        blue = int(255 * (0.2 * (1 - normalized)))   # 51 down to 0
+        
+        return [red, green, blue]
+    
+    # Apply color function
+    max_donation = h3_agg['total_annual'].max() if not h3_agg.empty else 1
+    h3_agg['color'] = h3_agg['total_annual'].apply(lambda x: get_color_for_donations(x, max_donation))
+    
+    # Format currency columns for tooltip display
+    h3_agg['total_annual_formatted'] = h3_agg['total_annual'].apply(lambda x: f"{x:,.0f}")
+    h3_agg['avg_annual_formatted'] = h3_agg['avg_annual'].apply(lambda x: f"{x:,.0f}")
+    h3_agg['total_cumulative_formatted'] = h3_agg['total_cumulative'].apply(lambda x: f"{x:,.0f}")
+    
+    # Define tooltip - PyDeck format
+    tooltip = {
+        "html": 
+            "<b>H3 Cell:</b> {" + h3_column + "}<br/>"
+            "<b>Donors:</b> {donor_count}<br/>"
+            "<b>Total Annual:</b> ${total_annual_formatted}<br/>"
+            "<b>Avg Annual:</b> ${avg_annual_formatted}<br/>"
+            "<b>Total Cumulative:</b> ${total_cumulative_formatted}<br/>",
+        "style": {
+            "backgroundColor": 'rgba(255, 87, 0, 0.9)',
+            "color": "white",
+            "fontSize": "14px",
+            "padding": "10px",
+            "borderRadius": "5px"
+        }
+    }
+    
+    # Create PyDeck H3 layer
+    h3_layer = pdk.Layer(
+        "H3HexagonLayer",
+        h3_agg,
+        pickable=True,
+        stroked=True,
+        filled=True,
+        extruded=False,
+        opacity=0.7,
+        get_hexagon=h3_column,  # Use the H3 index column
+        get_fill_color="color",  # Use the dynamically calculated color
+        get_line_color=[255, 255, 255],  # White borders
+        line_width_min_pixels=1,
+    )
+    
+    # Create the deck with white-bg style (no mapbox required)
+    deck = pdk.Deck(
+        layers=[h3_layer],
+        tooltip=tooltip,
+        initial_view_state=pdk.ViewState(
+            latitude=avg_latitude,
+            longitude=avg_longitude,
+            zoom=10,
+            pitch=0
+        ),
+        map_style=None  # white-bg style uses None
+    )
+    
+    return deck
+
+def create_h3_hexagon_map_plotly_fallback(df, resolution):
+    """Fallback H3 map using Plotly markers when PyDeck fails - uses existing H3 columns"""
+    st.info("🔄 Using Plotly fallback for H3 visualization...")
+    
+    # Use existing H3 columns like the working donor_targeting.strm
+    h3_column = f'H3_LEVEL_{resolution}'
+    
+    # Check if H3 column exists in dataframe
+    if h3_column not in df.columns:
+        st.warning(f"❌ H3 column {h3_column} not found in fallback either. Using simple scatter map.")
+        return create_simple_scatter_map(df)
+    
+    try:
+        # Aggregate data by H3 cell - same as PyDeck version
+        if 'ANNUAL_DONATION_AMOUNT' in df.columns:
+            # Alumni data with donations
+            h3_agg = df.groupby(h3_column).agg({
+                'ANNUAL_DONATION_AMOUNT': ['sum', 'mean', 'count'],
+                'CUMULATIVE_DONATION_AMOUNT': 'sum',
+                'LATITUDE': 'mean',
+                'LONGITUDE': 'mean'
+            }).round(2)
+            
+            h3_agg.columns = ['TOTAL_ANNUAL', 'AVG_ANNUAL', 'DONOR_COUNT', 'TOTAL_CUMULATIVE', 'CENTER_LAT', 'CENTER_LON']
+            h3_agg = h3_agg.reset_index()
+        else:
+            # Student data without donations
+            h3_agg = df.groupby(h3_column).agg({
+                'LATITUDE': ['mean', 'count'],
+                'LONGITUDE': 'mean'
+            }).round(2)
+            
+            h3_agg.columns = ['CENTER_LAT', 'DONOR_COUNT', 'CENTER_LON'] 
+            h3_agg = h3_agg.reset_index()
+            # For students, use count as the value
+            h3_agg['TOTAL_ANNUAL'] = h3_agg['DONOR_COUNT']
+            h3_agg['AVG_ANNUAL'] = h3_agg['DONOR_COUNT']
+            h3_agg['TOTAL_CUMULATIVE'] = h3_agg['DONOR_COUNT']
+        
+        if h3_agg.empty:
+            return create_simple_scatter_map(df)
+        
+        st.info(f"📊 Showing {len(h3_agg)} H3 spatial clusters as enhanced markers (Plotly fallback)")
+        
+        # Create scatter mapbox plot with H3 aggregated data
+        fig = px.scatter_mapbox(
+            h3_agg,
+            lat='CENTER_LAT',
+            lon='CENTER_LON',
+            size='DONOR_COUNT',
+            color='TOTAL_ANNUAL',
+            hover_data={
+                h3_column: True,
+                'DONOR_COUNT': True,
+                'TOTAL_ANNUAL': ':.0f',
+                'CENTER_LAT': False,
+                'CENTER_LON': False
+            },
+            color_continuous_scale='Oranges',  # Match working example colors
+            size_max=60,
+            title=f'H3 Spatial Analysis (Resolution Level {resolution}) - {len(h3_agg)} Clusters',
+            labels={
+                'TOTAL_ANNUAL': 'Total Value',
+                'DONOR_COUNT': 'Number of Records'
+            },
+            mapbox_style="white-bg"  # Set mapbox style directly in scatter_mapbox
+        )
+        
+        fig.update_layout(
+            mapbox=dict(
+                center=dict(lat=h3_agg['CENTER_LAT'].mean(), lon=h3_agg['CENTER_LON'].mean()),
+                zoom=10
+            ),
+            height=600,
+            margin=dict(l=0, r=0, t=30, b=0)
+        )
+        
+        return fig
+        
+    except Exception as e:
+        st.error(f"Error creating H3 fallback map: {str(e)}")
+        return create_simple_scatter_map(df)
+
+def create_h3_hexagon_map(df, resolution):
+    """Wrapper that tries PyDeck first, falls back to Plotly if needed"""
+    try:
+        # Try PyDeck first for true H3 hexagons
+        return create_h3_hexagon_map_pydeck(df, resolution)
+    except Exception as e:
+        st.warning(f"⚠️ PyDeck H3 visualization failed: {str(e)}")
+        st.info("🔄 Falling back to enhanced marker visualization...")
+        return create_h3_hexagon_map_plotly_fallback(df, resolution)
+
+def create_simple_scatter_map(df, map_style="white-bg"):
+    """Create a simple scatter map using PyDeck with proper data formatting"""
+    
+    # Remove rows with null coordinates
+    valid_df = df.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
+    if valid_df.empty:
+        st.error("❌ No valid coordinates available")
+        return None
+    
+    st.info(f"📍 Showing {len(valid_df)} individual donor locations")
+    
+    # Convert to rich dictionary format for PyDeck with all the details
+    data = []
+    for _, row in valid_df.iterrows():
+        # Color mapping for donor segments
+        segment = row.get('DONOR_SEGMENT', 'Unknown')
+        if segment == 'Major Donor':
+            color = [255, 0, 0, 160]  # Red
+        elif segment == 'Mid-Level Donor':
+            color = [255, 140, 0, 160]  # Orange
+        elif segment == 'Annual Donor':
+            color = [0, 166, 81, 160]  # Green
+        else:
+            color = [128, 128, 128, 160]  # Gray for unknown
+        
+        # Size based on donation amount (or default)
+        donation = row.get('ANNUAL_DONATION_AMOUNT', 1000)
+        radius = max(100, min(500, donation / 10))  # Scale radius by donation
+        
+        data.append({
+            'lat': float(row['LATITUDE']),
+            'lon': float(row['LONGITUDE']),
+            'name': str(row.get('FULL_NAME', 'Unknown')),
+            'segment': str(segment),
+            'donation': f"${donation:,.0f}" if donation else "$0",
+            'zip_code': str(row.get('ZIP_CODE', 'Unknown')),
+            'major': str(row.get('MAJOR', 'Unknown')),
+            'color': color,
+            'radius': radius
+        })
+    
+    # Use PyDeck ScatterplotLayer with rich features
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=data,
+        pickable=True,
+        opacity=0.8,
+        stroked=True,
+        filled=True,
+        radius_scale=6,
+        radius_min_pixels=3,
+        radius_max_pixels=100,
+        line_width_min_pixels=1,
+        get_position=['lon', 'lat'],
+        get_radius='radius',
+        get_fill_color='color',
+        get_line_color=[0, 0, 0],
+    )
+    
+    # Calculate center
+    center_lat = valid_df['LATITUDE'].mean()
+    center_lon = valid_df['LONGITUDE'].mean()
+    
+    # Add tooltips
+    tooltip = {
+        "html": 
+            "<b>Name:</b> {name}<br/>"
+            "<b>Donor Segment:</b> {segment}<br/>"
+            "<b>Annual Donation:</b> {donation}<br/>"
+            "<b>Major:</b> {major}<br/>"
+            "<b>Zip Code:</b> {zip_code}<br/>",
+        "style": {
+            "backgroundColor": 'rgba(31, 78, 121, 0.9)',
+            "color": "white",
+            "fontSize": "14px",
+            "padding": "10px",
+            "borderRadius": "5px"
+        }
+    }
+    
+    # Create PyDeck deck with better zoom level
+    deck = pdk.Deck(
+        layers=[scatter_layer],
+        tooltip=tooltip,
+        initial_view_state=pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lon,
+            zoom=9,  # Better zoom level - not too far out
+            pitch=0
+        ),
+        map_style=None  # Same as H3 - no external maps
+    )
+    
+    return deck
+
+def create_point_map(df, data_type="alumni"):
+    """Create point map for alumni or students"""
+    if data_type == "students":
+        return create_student_scatter_map(df)
+    else:
+        return create_simple_scatter_map(df, "carto-positron")
+
+def create_student_scatter_map(df, map_style="white-bg"):
+    """Create a scatter map specifically for student data using PyDeck"""
+    
+    # Remove rows with null coordinates
+    valid_df = df.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
+    if valid_df.empty:
+        st.error("❌ No valid coordinates available")
+        return None
+    
+    st.info(f"📍 Showing {len(valid_df)} individual student locations")
+    
+    # Convert to rich dictionary format for PyDeck with student-specific details
+    data = []
+    for _, row in valid_df.iterrows():
+        # Color mapping for student status
+        status = row.get('STUDENT_STATUS', 'Unknown')
+        if status == 'Enrolled':
+            color = [31, 78, 121, 160]  # Dark blue
+        elif status == 'Prospective':
+            color = [46, 134, 171, 160]  # Light blue
+        else:
+            color = [128, 128, 128, 160]  # Gray for unknown
+        
+        # Fixed radius for students (no donation amounts)
+        radius = 150
+        
+        # Combine first and last name
+        first_name = row.get('FIRST_NAME', '')
+        last_name = row.get('LAST_NAME', '')
+        full_name = f"{first_name} {last_name}".strip()
+        
+        data.append({
+            'lat': float(row['LATITUDE']),
+            'lon': float(row['LONGITUDE']),
+            'name': str(full_name) if full_name else 'Unknown',
+            'status': str(status),
+            'zip_code': str(row.get('ZIP_CODE', 'Unknown')),
+            'major': str(row.get('MAJOR', 'Unknown')),
+            'city': str(row.get('CITY', 'Unknown')),
+            'state': str(row.get('STATE', 'Unknown')),
+            'color': color,
+            'radius': radius
+        })
+    
+    # Use PyDeck ScatterplotLayer
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=data,
+        pickable=True,
+        opacity=0.8,
+        stroked=True,
+        filled=True,
+        radius_scale=6,
+        radius_min_pixels=3,
+        radius_max_pixels=100,
+        line_width_min_pixels=1,
+        get_position=['lon', 'lat'],
+        get_radius='radius',
+        get_fill_color='color',
+        get_line_color=[0, 0, 0],
+    )
+    
+    # Calculate center
+    center_lat = valid_df['LATITUDE'].mean()
+    center_lon = valid_df['LONGITUDE'].mean()
+    
+    # Student-specific tooltips
+    tooltip = {
+        "html": 
+            "<b>Name:</b> {name}<br/>"
+            "<b>Status:</b> {status}<br/>"
+            "<b>Major:</b> {major}<br/>"
+            "<b>City:</b> {city}, {state}<br/>"
+            "<b>Zip Code:</b> {zip_code}<br/>",
+        "style": {
+            "backgroundColor": 'rgba(31, 78, 121, 0.9)',
+            "color": "white",
+            "fontSize": "14px",
+            "padding": "10px",
+            "borderRadius": "5px"
+        }
+    }
+    
+    # Create PyDeck deck
+    deck = pdk.Deck(
+        layers=[scatter_layer],
+        tooltip=tooltip,
+        initial_view_state=pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lon,
+            zoom=9,
+            pitch=0
+        ),
+        map_style=None  # White background
+    )
+    
+    return deck
+
+def create_combined_point_map(df):
+    """Create point map for combined alumni and student data"""
+    valid_df = df.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
+    if valid_df.empty:
+        st.error("❌ No valid coordinates available")
+        return None
+    
+    st.info(f"📍 Showing {len(valid_df)} combined locations")
+    
+    # Convert to rich dictionary format for PyDeck
+    data = []
+    for _, row in valid_df.iterrows():
+        # Different colors for different data types and segments
+        data_type = row.get('DATA_TYPE', 'Unknown')
+        if data_type == 'Alumni':
+            segment = row.get('DONOR_SEGMENT', 'Unknown')
+            if segment == 'Major Donor':
+                color = [255, 0, 0, 160]  # Red
+            elif segment == 'Mid-Level Donor':
+                color = [255, 140, 0, 160]  # Orange
+            elif segment == 'Annual Donor':
+                color = [0, 166, 81, 160]  # Green
+            else:
+                color = [128, 128, 128, 160]  # Gray
+            
+            # Size based on donation for alumni
+            donation = row.get('ANNUAL_DONATION_AMOUNT', 1000) or 1000
+            radius = max(100, min(500, donation / 10))
+        else:
+            # Student colors
+            status = row.get('STATUS_OR_SEGMENT', 'Unknown')
+            if status == 'Enrolled':
+                color = [31, 78, 121, 160]  # Dark blue
+            elif status == 'Prospective':
+                color = [46, 134, 171, 160]  # Light blue
+            else:
+                color = [128, 128, 128, 160]  # Gray
+            
+            # Fixed size for students
+            radius = 150
+            donation = 0
+        
+        data.append({
+            'lat': float(row['LATITUDE']),
+            'lon': float(row['LONGITUDE']),
+            'name': str(row.get('PERSON_NAME', 'Unknown')),
+            'data_type': str(data_type),
+            'segment_status': str(row.get('STATUS_OR_SEGMENT', 'Unknown')),
+            'major': str(row.get('MAJOR', 'Unknown')),
+            'zip_code': str(row.get('ZIP_CODE', 'Unknown')),
+            'donation': f"${donation:,.0f}" if donation else "N/A",
+            'color': color,
+            'radius': radius
+        })
+    
+    # Create PyDeck layer
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=data,
+        pickable=True,
+        opacity=0.8,
+        stroked=True,
+        filled=True,
+        radius_scale=6,
+        radius_min_pixels=3,
+        radius_max_pixels=100,
+        line_width_min_pixels=1,
+        get_position=['lon', 'lat'],
+        get_radius='radius',
+        get_fill_color='color',
+        get_line_color=[0, 0, 0],
+    )
+    
+    # Calculate center
+    center_lat = valid_df['LATITUDE'].mean()
+    center_lon = valid_df['LONGITUDE'].mean()
+    
+    # Add tooltips
+    tooltip = {
+        "html": 
+            "<b>Name:</b> {name}<br/>"
+            "<b>Type:</b> {data_type}<br/>"
+            "<b>Segment/Status:</b> {segment_status}<br/>"
+            "<b>Major:</b> {major}<br/>"
+            "<b>Zip Code:</b> {zip_code}<br/>"
+            "<b>Donation:</b> {donation}<br/>",
+        "style": {
+            "backgroundColor": 'rgba(31, 78, 121, 0.9)',
+            "color": "white",
+            "fontSize": "14px",
+            "padding": "10px",
+            "borderRadius": "5px"
+        }
+    }
+    
+    # Create PyDeck deck
+    deck = pdk.Deck(
+        layers=[scatter_layer],
+        tooltip=tooltip,
+        initial_view_state=pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lon,
+            zoom=9,
+            pitch=0
+        ),
+        map_style=None
+    )
+    
+    return deck
+
+def create_h3_hexagon_map_pydeck(df, resolution, map_style="white-bg"):
+    """Create true H3 hexagon map using PyDeck H3HexagonLayer"""
+    h3_column = f'H3_LEVEL_{resolution}'
+    
+    # Check if H3 column exists in dataframe
+    if h3_column not in df.columns:
+        st.error(f"❌ H3 column {h3_column} not found in data")
+        return None
+    
+    # Handle combined data or alumni data differently
+    if 'DATA_TYPE' in df.columns:
+        # Combined data - aggregate by H3 and type
+        h3_agg = df.groupby(h3_column).agg({
+            'LATITUDE': 'mean',
+            'LONGITUDE': 'mean',
+            'PERSON_NAME': 'count',
+            'DATA_TYPE': lambda x: ', '.join(set(x))
+        }).round(2)
+        h3_agg.columns = ['center_lat', 'center_lon', 'total_count', 'data_types']
+    else:
+        # Alumni data only
+        h3_agg = df.groupby(h3_column).agg({
+            'ANNUAL_DONATION_AMOUNT': ['sum', 'mean', 'count'],
+            'CUMULATIVE_DONATION_AMOUNT': 'sum',
+            'LATITUDE': 'mean',
+            'LONGITUDE': 'mean'
+        }).round(2)
+        h3_agg.columns = ['total_annual', 'avg_annual', 'donor_count', 'total_cumulative', 'center_lat', 'center_lon']
+    
+    h3_agg = h3_agg.reset_index()
+    
+    # Check if we have valid aggregated data
+    if h3_agg.empty:
+        st.error("❌ No H3 aggregated data available")
+        return None
+    
+    st.success(f"✅ Creating H3 hexagons for {len(h3_agg)} spatial clusters!")
+    
+    # Define color function
+    if 'DATA_TYPE' in df.columns:
+        # Color based on record count for combined data
+        def get_color_for_count(count, max_count):
+            normalized = min(1.0, max(0.0, count / max_count)) if max_count > 0 else 0
+            red = int(255 * (0.2 + 0.8 * normalized))
+            green = int(255 * (0.4 + 0.6 * normalized))
+            blue = int(255 * (0.8))
+            return [red, green, blue]
+        
+        max_count = h3_agg['total_count'].max() if not h3_agg.empty else 1
+        h3_agg['color'] = h3_agg['total_count'].apply(lambda x: get_color_for_count(x, max_count))
+        h3_agg['total_count_formatted'] = h3_agg['total_count'].apply(lambda x: f"{x:,.0f}")
+        
+        # Tooltip for combined data
+        tooltip = {
+            "html": 
+                "<b>H3 Cell:</b> {" + h3_column + "}<br/>"
+                "<b>Total Records:</b> {total_count_formatted}<br/>"
+                "<b>Data Types:</b> {data_types}<br/>",
+            "style": {
+                "backgroundColor": 'rgba(31, 78, 121, 0.9)',
+                "color": "white",
+                "fontSize": "14px",
+                "padding": "10px",
+                "borderRadius": "5px"
+            }
+        }
+    else:
+        # Color based on donations for alumni data
+        def get_color_for_donations(donation_amount, max_donation):
+            normalized = min(1.0, max(0.0, donation_amount / max_donation)) if max_donation > 0 else 0
+            red = int(255 * (0.8 + 0.2 * normalized))
+            green = int(255 * (0.6 * (1 - normalized)))
+            blue = int(255 * (0.2 * (1 - normalized)))
+            return [red, green, blue]
+        
+        max_donation = h3_agg['total_annual'].max() if not h3_agg.empty else 1
+        h3_agg['color'] = h3_agg['total_annual'].apply(lambda x: get_color_for_donations(x, max_donation))
+        h3_agg['total_annual_formatted'] = h3_agg['total_annual'].apply(lambda x: f"{x:,.0f}")
+        h3_agg['avg_annual_formatted'] = h3_agg['avg_annual'].apply(lambda x: f"{x:,.0f}")
+        
+        # Tooltip for alumni data
+        tooltip = {
+            "html": 
+                "<b>H3 Cell:</b> {" + h3_column + "}<br/>"
+                "<b>Donors:</b> {donor_count}<br/>"
+                "<b>Total Annual:</b> ${total_annual_formatted}<br/>"
+                "<b>Avg Annual:</b> ${avg_annual_formatted}<br/>",
+            "style": {
+                "backgroundColor": 'rgba(255, 87, 0, 0.9)',
+                "color": "white",
+                "fontSize": "14px",
+                "padding": "10px",
+                "borderRadius": "5px"
+            }
+        }
+    
+    # Calculate map center
+    avg_latitude = h3_agg['center_lat'].mean()
+    avg_longitude = h3_agg['center_lon'].mean()
+    
+    # Create PyDeck H3 layer
+    h3_layer = pdk.Layer(
+        "H3HexagonLayer",
+        h3_agg,
+        pickable=True,
+        stroked=True,
+        filled=True,
+        extruded=False,
+        opacity=0.7,
+        get_hexagon=h3_column,
+        get_fill_color="color",
+        get_line_color=[255, 255, 255],
+        line_width_min_pixels=1,
+    )
+    
+    # Create the deck
+    deck = pdk.Deck(
+        layers=[h3_layer],
+        tooltip=tooltip,
+        initial_view_state=pdk.ViewState(
+            latitude=avg_latitude,
+            longitude=avg_longitude,
+            zoom=10,
+            pitch=0
+        ),
+        map_style=None  # White background
+    )
+    
+    return deck
+
+def create_h3_hexagon_map(df, resolution, map_style="white-bg"):
+    """Create H3 hexagon map - wrapper function"""
+    try:
+        return create_h3_hexagon_map_pydeck(df, resolution, map_style)
+    except Exception as e:
+        st.error(f"❌ H3 visualization failed: {str(e)}")
+        return None
+
+def calculate_distance_miles(lat1, lon1, lat2, lon2):
+    """Calculate distance in miles between two points using Haversine formula"""
+    try:
+        # Simple and robust conversion
+        lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
+        
+        # Basic sanity check (no strict validation)
+        if abs(lat1) > 90 or abs(lat2) > 90 or abs(lon1) > 180 or abs(lon2) > 180:
+            return None
+        
+        # Haversine formula
+        # Convert decimal degrees to radians
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        
+        # Haversine formula
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+        c = 2 * np.arcsin(np.sqrt(a))
+        
+        # Earth's radius in miles
+        r = 3959
+        distance = r * c
+        
+        return round(distance, 1)
+    
+    except Exception as e:
+        # If all else fails, use simple approximation
+        try:
+            lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
+            # Simple Pythagorean approximation (good enough for nearby points)
+            lat_diff = lat2 - lat1
+            lon_diff = lon2 - lon1
+            # Rough conversion: 1 degree ≈ 69 miles
+            distance = ((lat_diff * 69)**2 + (lon_diff * 69 * np.cos(np.radians((lat1 + lat2)/2)))**2)**0.5
+            return round(distance, 1)
+        except:
+            return None
+
+def find_matches_within_distance(alumni_df, student_df, distance_miles=25):
+    """Find alumni-student matches within specified distance and same major"""
+    matches = []
+    
+    # Filter out records with missing coordinates or major
+    valid_students = student_df.dropna(subset=['LATITUDE', 'LONGITUDE', 'MAJOR'])
+    valid_alumni = alumni_df.dropna(subset=['LATITUDE', 'LONGITUDE', 'MAJOR'])
+    
+    for _, student in valid_students.iterrows():
+        # Skip if major is 'Unknown'
+        if student['MAJOR'] == 'Unknown':
+            continue
+            
+        # Find alumni within distance with same major
+        matching_alumni = valid_alumni[
+            (valid_alumni['MAJOR'] == student['MAJOR'])
+        ]
+        
+        for _, alumni in matching_alumni.iterrows():
+            # Calculate distance using helper function
+            distance = calculate_distance_miles(
+                student['LATITUDE'], student['LONGITUDE'],
+                alumni['LATITUDE'], alumni['LONGITUDE']
+            )
+            
+            if distance is not None and distance <= distance_miles:
+                matches.append({
+                    'student_id': student['STUDENT_ID'],
+                    'student_name': f"{student.get('FIRST_NAME', 'Unknown')} {student.get('LAST_NAME', '')}".strip(),
+                    'student_status': student.get('STUDENT_STATUS', 'Unknown'),
+                    'alumni_id': alumni['DONOR_ID'],
+                    'alumni_name': alumni.get('FULL_NAME', 'Unknown'),
+                    'major': student['MAJOR'],
+                    'distance_miles': distance,
+                    'student_zip': student.get('ZIP_CODE', 'Unknown'),
+                    'alumni_zip': alumni.get('ZIP_CODE', 'Unknown'),
+                    'student_lat': student['LATITUDE'],
+                    'student_lon': student['LONGITUDE'],
+                    'alumni_lat': alumni['LATITUDE'],
+                    'alumni_lon': alumni['LONGITUDE'],
+                    'alumni_donation': alumni.get('ANNUAL_DONATION_AMOUNT', 0),
+                    'alumni_grad_year': alumni.get('GRADUATION_YEAR', 'Unknown')
+                })
+    
+    return pd.DataFrame(matches)
+
+def create_match_map(matches_df):
+    """Create a map showing alumni-student matches with connections"""
+    if matches_df.empty:
+        return None
+    
+    fig = go.Figure()
+    
+    # Add student points
+    fig.add_trace(go.Scattermapbox(
+        lat=matches_df['student_lat'],
+        lon=matches_df['student_lon'],
+        mode='markers',
+        marker=dict(
+            size=12,
+            color='#2e86ab',
+            symbol='circle'
+        ),
+        text=matches_df['student_name'],
+        name='Students',
+        hovertemplate='<b>Student:</b> %{text}<br>' +
+                      '<b>Status:</b> ' + matches_df['student_status'].astype(str) + '<br>' +
+                      '<b>Major:</b> ' + matches_df['major'].astype(str) + '<br>' +
+                      '<b>Zip:</b> ' + matches_df['student_zip'].astype(str) +
+                      '<extra></extra>'
+    ))
+    
+    # Add alumni points
+    fig.add_trace(go.Scattermapbox(
+        lat=matches_df['alumni_lat'],
+        lon=matches_df['alumni_lon'],
+        mode='markers',
+        marker=dict(
+            size=10,
+            color='#1f4e79',
+            symbol='diamond'
+        ),
+        text=matches_df['alumni_name'],
+        name='Alumni',
+        hovertemplate='<b>Alumni:</b> %{text}<br>' +
+                      '<b>Graduation:</b> ' + matches_df['alumni_grad_year'].astype(str) + '<br>' +
+                      '<b>Major:</b> ' + matches_df['major'].astype(str) + '<br>' +
+                      '<b>Annual Donation:</b> $' + matches_df['alumni_donation'].astype(str) + '<br>' +
+                      '<b>Zip:</b> ' + matches_df['alumni_zip'].astype(str) +
+                      '<extra></extra>'
+    ))
+    
+    # Add connection lines
+    for _, match in matches_df.iterrows():
+        fig.add_trace(go.Scattermapbox(
+            lat=[match['student_lat'], match['alumni_lat']],
+            lon=[match['student_lon'], match['alumni_lon']],
+            mode='lines',
+            line=dict(width=2, color='rgba(255, 140, 0, 0.6)'),
+            showlegend=False,
+            hovertemplate=f'<b>Connection:</b><br>' +
+                         f'Distance: {match["distance_miles"]:.1f} miles<br>' +
+                         f'Major: {match["major"]}<extra></extra>'
+        ))
+    
+    # Calculate map center
+    all_lats = list(matches_df['student_lat']) + list(matches_df['alumni_lat'])
+    all_lons = list(matches_df['student_lon']) + list(matches_df['alumni_lon'])
+    center_lat = np.mean(all_lats)
+    center_lon = np.mean(all_lons)
+    
+    # Set map layout
+    fig.update_layout(
+        mapbox=dict(
+            style="white-bg",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=9
+        ),
+        height=600,
+        margin=dict(l=0, r=0, t=30, b=0),
+        title='Alumni-Student Match Connections',
+        showlegend=True
+    )
+    
+    return fig
+
+def create_analytics_charts(alumni_df, student_df=None, matches_df=None):
+    """Create various analytics charts"""
+    charts = []
+    
+    # Alumni by graduation year
+    if not alumni_df.empty:
+        grad_year_data = alumni_df.groupby('GRADUATION_YEAR').agg({
+            'ANNUAL_DONATION_AMOUNT': ['sum', 'count']
+        }).round(2)
+        grad_year_data.columns = ['total_donations', 'alumni_count']
+        grad_year_data = grad_year_data.reset_index()
+        
+        fig1 = px.bar(
+            grad_year_data,
+            x='GRADUATION_YEAR',
+            y='alumni_count',
+            title='Alumni Count by Graduation Year',
+            color='total_donations',
+            color_continuous_scale='Blues'
+        )
+        charts.append(("Alumni by Graduation Year", fig1))
+    
+    # Major distribution comparison
+    if not alumni_df.empty and student_df is not None and not student_df.empty:
+        alumni_majors = alumni_df['MAJOR'].value_counts().head(10)
+        student_majors = student_df['MAJOR'].value_counts().head(10)
+        
+        # Create comparison chart
+        comparison_data = pd.DataFrame({
+            'Major': list(set(alumni_majors.index) | set(student_majors.index)),
+        })
+        comparison_data['Alumni_Count'] = comparison_data['Major'].map(alumni_majors).fillna(0)
+        comparison_data['Student_Count'] = comparison_data['Major'].map(student_majors).fillna(0)
+        
+        fig2 = go.Figure(data=[
+            go.Bar(name='Alumni', x=comparison_data['Major'], y=comparison_data['Alumni_Count']),
+            go.Bar(name='Students', x=comparison_data['Major'], y=comparison_data['Student_Count'])
+        ])
+        fig2.update_layout(barmode='group', title='Alumni vs Students by Major')
+        charts.append(("Major Comparison", fig2))
+    
+    # Geographic distribution
+    if not alumni_df.empty:
+        zip_data = alumni_df.groupby('ZIP_CODE').agg({
+            'ANNUAL_DONATION_AMOUNT': 'sum',
+            'DONOR_ID': 'count'
+        }).sort_values('ANNUAL_DONATION_AMOUNT', ascending=False).head(10)
+        zip_data = zip_data.reset_index()
+        
+        # Convert ZIP_CODE to string to prevent numeric formatting
+        zip_data['ZIP_CODE'] = zip_data['ZIP_CODE'].astype(str)
+        
+        fig3 = px.bar(
+            zip_data,
+            x='ZIP_CODE',
+            y='DONOR_ID',
+            title='Top 10 Zip Codes by Alumni Count',
+            color='ANNUAL_DONATION_AMOUNT',
+            color_continuous_scale='Oranges'
+        )
+        # Ensure x-axis shows full zip codes, not abbreviated
+        fig3.update_layout(xaxis=dict(type='category'))
+        charts.append(("Geographic Distribution", fig3))
+    
+    # Matching analytics
+    if matches_df is not None and not matches_df.empty:
+        # Match distance distribution
+        fig4 = px.histogram(
+            matches_df,
+            x='distance_miles',
+            nbins=20,
+            title='Distribution of Match Distances',
+            labels={'distance_miles': 'Distance (miles)', 'count': 'Number of Matches'},
+            color_discrete_sequence=['#2e86ab']
+        )
+        charts.append(("Match Distance Distribution", fig4))
+        
+        # Matches by major
+        major_matches = matches_df['major'].value_counts().head(10)
+        fig5 = px.bar(
+            x=major_matches.index,
+            y=major_matches.values,
+            title='Top 10 Majors with Alumni-Student Matches',
+            labels={'x': 'Major', 'y': 'Number of Matches'},
+            color=major_matches.values,
+            color_continuous_scale='Viridis'
+        )
+        fig5.update_layout(xaxis_tickangle=-45)
+        charts.append(("Matches by Major", fig5))
+    
+    # Student status distribution (if student data available)
+    if student_df is not None and not student_df.empty:
+        status_counts = student_df['STUDENT_STATUS'].value_counts()
+        fig6 = px.pie(
+            values=status_counts.values,
+            names=status_counts.index,
+            title='Student Status Distribution',
+            color_discrete_sequence=['#1f4e79', '#2e86ab']
+        )
+        charts.append(("Student Status Distribution", fig6))
+    
+    return charts
+
+def main():
+    # Header
+    st.markdown('<h1 class="main-header">🎓 Higher Ed Alumni Recruitment & Retention</h1>', 
+                unsafe_allow_html=True)
+    st.markdown('<h2 class="sub-header">Alumni Engagement • Student Networking • Recruitment Analytics</h2>', 
+                unsafe_allow_html=True)
+    
+    # Load data
+    with st.spinner("Loading data from Snowflake..."):
+        try:
+            alumni_df = load_alumni_data()
+            student_df = load_student_data()
+            
+            if alumni_df.empty:
+                st.error("No alumni data found. Please ensure the ALUMNI_DONORS table is populated.")
+                st.stop()
+            
+            # Clean data - handle null values in key columns
+            if not alumni_df.empty:
+                # Fill null values with meaningful defaults
+                alumni_df['MAJOR'] = alumni_df['MAJOR'].fillna('Unknown')
+                alumni_df['ZIP_CODE'] = alumni_df['ZIP_CODE'].fillna('Unknown')
+                alumni_df['DONOR_SEGMENT'] = alumni_df['DONOR_SEGMENT'].fillna('Unknown')
+                
+            if not student_df.empty:
+                # Fill null values with meaningful defaults  
+                student_df['MAJOR'] = student_df['MAJOR'].fillna('Unknown')
+                student_df['ZIP_CODE'] = student_df['ZIP_CODE'].fillna('Unknown')
+                student_df['STUDENT_STATUS'] = student_df['STUDENT_STATUS'].fillna('Unknown')
+                
+        except Exception as e:
+            st.error(f"Error loading data: {str(e)}")
+            st.info("Please ensure the database tables have been created and populated.")
+            st.stop()
+    
+    # Main tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🎯 Alumni Analysis", 
+        "👥 Student Overview", 
+        "🤝 Networking & Matching", 
+        "📊 Analytics Dashboard"
+    ])
+    
+    with tab1:
+        st.markdown('<h3 class="sub-header">Alumni Geographic & Demographic Analysis</h3>', 
+                   unsafe_allow_html=True)
+        
+        # Alumni sidebar filters
+        st.sidebar.markdown('<div class="filter-section">', unsafe_allow_html=True)
+        st.sidebar.markdown('<h3 class="sub-header">🎯 Alumni Filters</h3>', unsafe_allow_html=True)
+        
+        # Get all available options for dynamic filtering (filter out null values)
+        all_alumni_zips = sorted([z for z in alumni_df['ZIP_CODE'].unique() if z is not None and pd.notna(z)])
+        all_alumni_majors = sorted([m for m in alumni_df['MAJOR'].unique() if m is not None and pd.notna(m)])
+        
+        # Initialize session state for alumni filters
+        if 'alumni_zip_codes' not in st.session_state:
+            st.session_state.alumni_zip_codes = all_alumni_zips[:10] if len(all_alumni_zips) >= 10 else all_alumni_zips
+        if 'alumni_majors' not in st.session_state:
+            st.session_state.alumni_majors = all_alumni_majors[:5] if len(all_alumni_majors) >= 5 else all_alumni_majors
+        
+        # Dynamic zip code filter
+        st.sidebar.markdown("**Select Zip Codes**")
+        col_zip1, col_zip2 = st.sidebar.columns(2)
+        with col_zip1:
+            if st.button("All Zips", key="alumni_select_all_zips"):
+                st.session_state.alumni_zip_codes = all_alumni_zips
+        with col_zip2:
+            if st.button("Clear Zips", key="alumni_clear_all_zips"):
+                st.session_state.alumni_zip_codes = []
+        
+        # Get dynamic options based on current major selection
+        available_zips, _ = get_dynamic_filter_options(
+            alumni_df, 
+            selected_majors=st.session_state.alumni_majors
+        )
+        
+        alumni_zip_codes = st.sidebar.multiselect(
+            "Zip Codes",
+            options=available_zips if available_zips else all_alumni_zips,
+            default=[z for z in st.session_state.alumni_zip_codes if z in (available_zips if available_zips else all_alumni_zips)],
+            key="alumni_zip_multiselect"
+        )
+        st.session_state.alumni_zip_codes = alumni_zip_codes
+        
+        # Dynamic major filter
+        st.sidebar.markdown("**Select Majors**")
+        col_maj1, col_maj2 = st.sidebar.columns(2)
+        with col_maj1:
+            if st.button("All Majors", key="alumni_select_all_majors"):
+                st.session_state.alumni_majors = all_alumni_majors
+        with col_maj2:
+            if st.button("Clear Majors", key="alumni_clear_all_majors"):
+                st.session_state.alumni_majors = []
+        
+        # Get dynamic options based on current zip selection
+        _, available_majors = get_dynamic_filter_options(
+            alumni_df, 
+            selected_zips=alumni_zip_codes
+        )
+        
+        alumni_majors = st.sidebar.multiselect(
+            "Majors",
+            options=available_majors if available_majors else all_alumni_majors,
+            default=[m for m in st.session_state.alumni_majors if m in (available_majors if available_majors else all_alumni_majors)],
+            key="alumni_major_multiselect"
+        )
+        st.session_state.alumni_majors = alumni_majors
+        
+        # Graduation year filter
+        min_year = int(alumni_df['GRADUATION_YEAR'].min())
+        max_year = int(alumni_df['GRADUATION_YEAR'].max())
+        alumni_grad_years = st.sidebar.slider(
+            "Graduation Year Range",
+            min_value=min_year,
+            max_value=max_year,
+            value=(min_year, max_year)
+        )
+        
+        # Donation amount filter
+        min_donation = float(alumni_df['ANNUAL_DONATION_AMOUNT'].min())
+        max_donation = float(alumni_df['ANNUAL_DONATION_AMOUNT'].max())
+        alumni_donation_range = st.sidebar.slider(
+            "Annual Donation Range ($)",
+            min_value=min_donation,
+            max_value=max_donation,
+            value=(min_donation, max_donation),
+            format="$%.0f"
+        )
+        
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
+        
+        # Apply alumni filters
+        filtered_alumni = apply_alumni_filters(
+            alumni_df, alumni_zip_codes, alumni_majors, 
+            alumni_grad_years, alumni_donation_range
+        )
+        
+        # Alumni overview metrics
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                label="📊 Total Alumni",
+                value=f"{len(filtered_alumni):,}",
+                delta=f"{len(filtered_alumni) - len(alumni_df):,} filtered"
+            )
+        
+        with col2:
+            total_annual = filtered_alumni['ANNUAL_DONATION_AMOUNT'].sum()
+            st.metric(
+                label="💰 Total Annual Donations",
+                value=f"${total_annual:,.0f}",
+                delta=f"${filtered_alumni['ANNUAL_DONATION_AMOUNT'].mean():,.0f} avg"
+            )
+        
+        with col3:
+            major_donors = len(filtered_alumni[filtered_alumni['DONOR_SEGMENT'] == 'Major Donor'])
+            st.metric(
+                label="🌟 Major Donors",
+                value=f"{major_donors:,}",
+                delta=f"{major_donors/len(filtered_alumni)*100:.1f}%" if len(filtered_alumni) > 0 else "0%"
+            )
+        
+        with col4:
+            unique_majors = filtered_alumni['MAJOR'].nunique()
+            st.metric(
+                label="🎓 Majors Represented",
+                value=f"{unique_majors:,}",
+                delta=f"{len(filtered_alumni['ZIP_CODE'].unique())} zip codes"
+            )
+        
+        st.markdown("---")
+        
+        # Map controls
+        col1, col2 = st.columns([2, 2])
+        
+        with col1:
+            alumni_map_type = st.selectbox(
+                "Alumni Map Type",
+                ["H3 Hexagonal Grid", "Individual Points"],
+                key="alumni_map_type"
+            )
+        
+        with col2:
+            alumni_h3_resolution = 8
+            if alumni_map_type == "H3 Hexagonal Grid":
+                alumni_h3_resolution = st.slider(
+                    "H3 Resolution",
+                    min_value=7,
+                    max_value=9,
+                    value=8,
+                    key="alumni_h3_resolution"
+                )
+        
+        # Display alumni map
+        if not filtered_alumni.empty:
+            if alumni_map_type == "H3 Hexagonal Grid":
+                result = create_h3_hexagon_map(filtered_alumni, alumni_h3_resolution)
+            else:
+                result = create_point_map(filtered_alumni, "alumni")
+            
+            if result is not None:
+                # Check if it's a PyDeck deck or Plotly figure
+                if hasattr(result, 'layers'):  # PyDeck deck
+                    st.pydeck_chart(result)
+                else:  # Plotly figure
+                    st.plotly_chart(result, use_container_width=True)
+            else:
+                st.error("❌ Unable to create alumni map")
+            
+            # Alumni data table section
+            st.markdown("---")
+            st.markdown("### 📋 Alumni Details")
+            
+            if not filtered_alumni.empty:
+                # Display options
+                col_table1, col_table2 = st.columns([1, 3])
+                with col_table1:
+                    show_alumni_records = st.selectbox(
+                        "Records to display:",
+                        [25, 50, 100, "All"],
+                        index=0,
+                        key="alumni_show_records"
+                    )
+                
+                # Apply display limit
+                if show_alumni_records == "All":
+                    display_alumni_df = filtered_alumni
+                else:
+                    display_alumni_df = filtered_alumni.head(show_alumni_records)
+                
+                # Format display columns
+                alumni_display_columns = [
+                    'FULL_NAME', 'ZIP_CODE', 'GRADUATION_YEAR', 'MAJOR', 
+                    'ANNUAL_DONATION_AMOUNT', 'CUMULATIVE_DONATION_AMOUNT', 
+                    'DONOR_SEGMENT', 'CITY', 'STATE'
+                ]
+                
+                available_alumni_columns = [col for col in alumni_display_columns if col in filtered_alumni.columns]
+                alumni_table_df = display_alumni_df[available_alumni_columns].copy()
+                
+                # Format currency columns
+                if 'ANNUAL_DONATION_AMOUNT' in alumni_table_df.columns:
+                    alumni_table_df['ANNUAL_DONATION_AMOUNT'] = alumni_table_df['ANNUAL_DONATION_AMOUNT'].apply(lambda x: f"${x:,.0f}")
+                if 'CUMULATIVE_DONATION_AMOUNT' in alumni_table_df.columns:
+                    alumni_table_df['CUMULATIVE_DONATION_AMOUNT'] = alumni_table_df['CUMULATIVE_DONATION_AMOUNT'].apply(lambda x: f"${x:,.0f}")
+                
+                st.dataframe(
+                    alumni_table_df,
+                    use_container_width=True,
+                    height=400,
+                    column_config={
+                        "FULL_NAME": "Alumni Name",
+                        "ZIP_CODE": "Zip Code",
+                        "GRADUATION_YEAR": "Grad Year",
+                        "MAJOR": "Major",
+                        "ANNUAL_DONATION_AMOUNT": "Annual Donation",
+                        "CUMULATIVE_DONATION_AMOUNT": "Lifetime Donation",
+                        "DONOR_SEGMENT": "Donor Segment"
+                    }
+                )
+                
+                # Download alumni data
+                col_download1, col_download2 = st.columns(2)
+                with col_download1:
+                    csv_alumni_data = filtered_alumni.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 Download Alumni Data",
+                        data=csv_alumni_data,
+                        file_name=f"alumni_data_{len(filtered_alumni)}_records.csv",
+                        mime="text/csv",
+                        help="Download filtered alumni dataset"
+                    )
+                
+                if show_alumni_records != "All" and len(filtered_alumni) > show_alumni_records:
+                    st.info(f"Showing first {show_alumni_records} of {len(filtered_alumni)} alumni. Use download button to get complete data.")
+        else:
+            st.warning("No alumni data matches current filters.")
+    
+    with tab2:
+        st.markdown('<h3 class="sub-header">Student Geographic Distribution</h3>', 
+                   unsafe_allow_html=True)
+        
+        if not student_df.empty:
+            # Student filters in sidebar
+            st.sidebar.markdown("---")
+            st.sidebar.markdown('<h3 class="sub-header">👥 Student Filters</h3>', unsafe_allow_html=True)
+            
+            # Get all available options for students (filter out null values)
+            all_student_zips = sorted([z for z in student_df['ZIP_CODE'].unique() if z is not None and pd.notna(z)])
+            all_student_majors = sorted([m for m in student_df['MAJOR'].unique() if m is not None and pd.notna(m)])
+            
+            # Student status filter
+            student_status = st.sidebar.multiselect(
+                "Student Status",
+                options=['Enrolled', 'Prospective'],
+                default=['Enrolled', 'Prospective']
+            )
+            
+            # Student zip codes
+            student_zip_codes = st.sidebar.multiselect(
+                "Student Zip Codes",
+                options=all_student_zips,
+                default=all_student_zips[:10] if len(all_student_zips) >= 10 else all_student_zips
+            )
+            
+            # Student majors
+            student_majors = st.sidebar.multiselect(
+                "Student Majors",
+                options=all_student_majors,
+                default=all_student_majors[:5] if len(all_student_majors) >= 5 else all_student_majors
+            )
+            
+            # Apply student filters
+            filtered_students = apply_student_filters(
+                student_df, student_zip_codes, student_majors, student_status
+            )
+            
+            # Student overview metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric(
+                    label="👥 Total Students",
+                    value=f"{len(filtered_students):,}",
+                    delta=f"{len(filtered_students) - len(student_df):,} filtered"
+                )
+            
+            with col2:
+                enrolled_count = len(filtered_students[filtered_students['STUDENT_STATUS'] == 'Enrolled'])
+                st.metric(
+                    label="📚 Enrolled Students",
+                    value=f"{enrolled_count:,}",
+                    delta=f"{enrolled_count/len(filtered_students)*100:.1f}%" if len(filtered_students) > 0 else "0%"
+                )
+            
+            with col3:
+                prospective_count = len(filtered_students[filtered_students['STUDENT_STATUS'] == 'Prospective'])
+                st.metric(
+                    label="🔍 Prospective Students",
+                    value=f"{prospective_count:,}",
+                    delta=f"{prospective_count/len(filtered_students)*100:.1f}%" if len(filtered_students) > 0 else "0%"
+                )
+            
+            with col4:
+                student_unique_majors = filtered_students['MAJOR'].nunique()
+                st.metric(
+                    label="🎓 Majors of Interest",
+                    value=f"{student_unique_majors:,}",
+                    delta=f"{len(filtered_students['ZIP_CODE'].unique())} zip codes"
+                )
+            
+            st.markdown("---")
+            
+            # Student map controls
+            col1, col2 = st.columns([2, 2])
+            
+            with col1:
+                student_map_type = st.selectbox(
+                    "Student Map Type",
+                    ["H3 Hexagonal Grid", "Individual Points"],
+                    key="student_map_type"
+                )
+            
+            with col2:
+                student_h3_resolution = 8
+                if student_map_type == "H3 Hexagonal Grid":
+                    student_h3_resolution = st.slider(
+                        "Student H3 Resolution",
+                        min_value=7,
+                        max_value=9,
+                        value=8,
+                        key="student_h3_resolution"
+                    )
+            
+            # Display student map
+            if not filtered_students.empty:
+                if student_map_type == "H3 Hexagonal Grid":
+                    result = create_h3_hexagon_map(filtered_students, student_h3_resolution)
+                else:
+                    result = create_point_map(filtered_students, "students")
+                
+                if result is not None:
+                    # Check if it's a PyDeck deck or Plotly figure
+                    if hasattr(result, 'layers'):  # PyDeck deck
+                        st.pydeck_chart(result)
+                    else:  # Plotly figure
+                        st.plotly_chart(result, use_container_width=True)
+                else:
+                    st.error("❌ Unable to create student map")
+                
+                # Student data table section
+                st.markdown("---")
+                st.markdown("### 📋 Student Details")
+                
+                # Display options
+                col_table1, col_table2 = st.columns([1, 3])
+                with col_table1:
+                    show_student_records = st.selectbox(
+                        "Records to display:",
+                        [25, 50, 100, "All"],
+                        index=0,
+                        key="student_show_records"
+                    )
+                
+                # Apply display limit
+                if show_student_records == "All":
+                    display_student_df = filtered_students
+                else:
+                    display_student_df = filtered_students.head(show_student_records)
+                
+                # Format display columns
+                student_display_columns = [
+                    'FIRST_NAME', 'LAST_NAME', 'ZIP_CODE', 'MAJOR', 
+                    'STUDENT_STATUS', 'CITY', 'STATE'
+                ]
+                
+                available_student_columns = [col for col in student_display_columns if col in filtered_students.columns]
+                student_table_df = display_student_df[available_student_columns].copy()
+                
+                st.dataframe(
+                    student_table_df,
+                    use_container_width=True,
+                    height=400,
+                    column_config={
+                        "FIRST_NAME": "First Name",
+                        "LAST_NAME": "Last Name",
+                        "ZIP_CODE": "Zip Code",
+                        "MAJOR": "Major",
+                        "STUDENT_STATUS": "Status",
+                        "CITY": "City",
+                        "STATE": "State"
+                    }
+                )
+                
+                # Download student data
+                col_download1, col_download2 = st.columns(2)
+                with col_download1:
+                    csv_student_data = filtered_students.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 Download Student Data",
+                        data=csv_student_data,
+                        file_name=f"student_data_{len(filtered_students)}_records.csv",
+                        mime="text/csv",
+                        help="Download filtered student dataset"
+                    )
+                
+                if show_student_records != "All" and len(filtered_students) > show_student_records:
+                    st.info(f"Showing first {show_student_records} of {len(filtered_students)} students. Use download button to get complete data.")
+            else:
+                st.warning("No student data matches current filters.")
+        else:
+            st.warning("No student data available.")
+    
+    with tab3:
+        st.markdown('<h3 class="sub-header">Combined Alumni & Student Geographic View</h3>', 
+                   unsafe_allow_html=True)
+        
+        # Use filtered data from the other tabs if available
+        current_alumni = filtered_alumni if 'filtered_alumni' in locals() else alumni_df
+        current_students = filtered_students if 'filtered_students' in locals() else student_df
+        
+        if not current_alumni.empty and not current_students.empty:
+            # Show current filter info
+            st.info(f"📊 Using filtered data: **{len(current_alumni):,} alumni** and **{len(current_students):,} students** from your tab filters")
+            
+            # Controls in 3 columns
+            col1, col2, col3 = st.columns([1, 1, 1])
+            
+            with col1:
+                show_alumni = st.checkbox("Show Alumni", value=True)
+                show_students = st.checkbox("Show Students", value=True)
+            
+            with col2:
+                # Map visualization type
+                combined_map_type = st.selectbox(
+                    "Map View Type",
+                    ["H3 Hexagonal Grid", "Individual Points"],
+                    key="combined_map_type"
+                )
+                
+                if combined_map_type == "H3 Hexagonal Grid":
+                    combined_h3_resolution = st.selectbox(
+                        "H3 Grid Resolution", 
+                        [7, 8, 9], 
+                        index=1,
+                        key="combined_h3_resolution"
+                    )
+            
+            with col3:
+                # Student focus filter
+                st.markdown("**🎯 Focus on One Student**")
+                
+                # Create student name options
+                student_names = []
+                if show_students and not current_students.empty:
+                    for _, student in current_students.iterrows():
+                        first_name = student.get('FIRST_NAME', '')
+                        last_name = student.get('LAST_NAME', '')
+                        full_name = f"{first_name} {last_name}".strip()
+                        if full_name:
+                            student_names.append(full_name)
+                
+                student_names = sorted(set(student_names))  # Remove duplicates and sort
+                student_names.insert(0, "All Students")  # Add "All" option at the top
+                
+                selected_student = st.selectbox(
+                    "Select Student:",
+                    student_names,
+                    index=0,
+                    key="selected_student"
+                )
+                
+                if selected_student != "All Students":
+                    st.success(f"🎯 **Focused on:** {selected_student}")
+                    if st.button("🔄 Show All Students", key="clear_student_filter"):
+                        st.rerun()  # Reset to show all students
+                else:
+                    st.info("👥 Showing all students")
+            
+            # Create combined dataset using FILTERED data
+            combined_data = []
+            
+            if show_alumni:
+                # Add FILTERED alumni data with address fields
+                alumni_cols = ['LATITUDE', 'LONGITUDE', 'FULL_NAME', 'MAJOR', 'ZIP_CODE', 'DONOR_SEGMENT', 'ANNUAL_DONATION_AMOUNT']
+                
+                # Add address fields if they exist
+                for addr_col in ['STREET_ADDRESS', 'CITY', 'STATE']:
+                    if addr_col in current_alumni.columns:
+                        alumni_cols.append(addr_col)
+                
+                alumni_subset = current_alumni[alumni_cols].copy()
+                alumni_subset['DATA_TYPE'] = 'Alumni'
+                alumni_subset['PERSON_NAME'] = alumni_subset['FULL_NAME']
+                alumni_subset['STATUS_OR_SEGMENT'] = alumni_subset['DONOR_SEGMENT']
+                combined_data.append(alumni_subset)
+            
+            if show_students:
+                # Add FILTERED student data with address fields
+                student_cols = ['LATITUDE', 'LONGITUDE', 'FIRST_NAME', 'LAST_NAME', 'MAJOR', 'ZIP_CODE', 'STUDENT_STATUS']
+                
+                # Add address fields if they exist  
+                for addr_col in ['STREET_ADDRESS', 'CITY', 'STATE']:
+                    if addr_col in current_students.columns:
+                        student_cols.append(addr_col)
+                
+                student_subset = current_students[student_cols].copy()
+                
+                # Apply single student filter if selected
+                if selected_student != "All Students":
+                    # Filter to only the selected student
+                    student_subset['TEMP_FULL_NAME'] = student_subset['FIRST_NAME'] + ' ' + student_subset['LAST_NAME']
+                    student_subset = student_subset[student_subset['TEMP_FULL_NAME'].str.strip() == selected_student].copy()
+                    student_subset = student_subset.drop('TEMP_FULL_NAME', axis=1)
+                
+                if not student_subset.empty:
+                    student_subset['DATA_TYPE'] = 'Student'
+                    student_subset['PERSON_NAME'] = student_subset['FIRST_NAME'] + ' ' + student_subset['LAST_NAME']
+                    student_subset['STATUS_OR_SEGMENT'] = student_subset['STUDENT_STATUS']
+                    student_subset['DONOR_SEGMENT'] = None
+                    student_subset['ANNUAL_DONATION_AMOUNT'] = None
+                    combined_data.append(student_subset)
+            
+            if combined_data:
+                # Union the data
+                combined_df = pd.concat(combined_data, ignore_index=True)
+                
+                # Add H3 columns if they exist in the original alumni data
+                if show_alumni and f'H3_LEVEL_{combined_h3_resolution if combined_map_type == "H3 Hexagonal Grid" else 8}' in current_alumni.columns:
+                    # Get H3 values from FILTERED alumni data
+                    h3_col = f'H3_LEVEL_{combined_h3_resolution if combined_map_type == "H3 Hexagonal Grid" else 8}'
+                    alumni_h3 = current_alumni[['LATITUDE', 'LONGITUDE', h3_col]].copy()
+                    combined_df = combined_df.merge(alumni_h3, on=['LATITUDE', 'LONGITUDE'], how='left')
+                
+                # Calculate distances if a single student is selected
+                if selected_student != "All Students" and show_students:
+                    # Find the selected student's coordinates
+                    student_row = combined_df[
+                        (combined_df['DATA_TYPE'] == 'Student') & 
+                        (combined_df['PERSON_NAME'] == selected_student)
+                    ]
+                    
+                    if not student_row.empty:
+                        student_lat = student_row.iloc[0]['LATITUDE']
+                        student_lon = student_row.iloc[0]['LONGITUDE']
+                        
+                        # Check if student coordinates are valid
+                        if pd.isna(student_lat) or pd.isna(student_lon):
+                            st.error(f"❌ Selected student {selected_student} has invalid coordinates")
+                            combined_df['DISTANCE_TO_STUDENT'] = None
+                        else:
+                            # Calculate distance from selected student to each alumni
+                            def calc_distance_to_student(row):
+                                if row['DATA_TYPE'] == 'Alumni':
+                                    # Check if coordinates are valid
+                                    if pd.notna(row['LATITUDE']) and pd.notna(row['LONGITUDE']):
+                                        try:
+                                            # Simple distance calculation
+                                            lat1, lon1 = float(student_lat), float(student_lon)
+                                            lat2, lon2 = float(row['LATITUDE']), float(row['LONGITUDE'])
+                                            
+                                            # Pythagorean approximation: 1 degree ≈ 69 miles
+                                            lat_diff = lat2 - lat1
+                                            lon_diff = lon2 - lon1
+                                            lat_part = (lat_diff * 69)**2
+                                            lon_part = (lon_diff * 69)**2
+                                            total = lat_part + lon_part
+                                            distance = total**0.5
+                                            
+                                            # Round to 1 decimal place
+                                            return float(f"{distance:.1f}")
+                                        except:
+                                            return -1
+                                    else:
+                                        return -1  # Invalid coordinates
+                                else:
+                                    return 0.0  # Student's distance to themselves
+                            
+                            combined_df['DISTANCE_TO_STUDENT'] = combined_df.apply(calc_distance_to_student, axis=1)
+                            
+                            # Check for any invalid distances
+                            invalid_distances = combined_df[
+                                (combined_df['DATA_TYPE'] == 'Alumni') & 
+                                ((combined_df['DISTANCE_TO_STUDENT'].isna()) | (combined_df['DISTANCE_TO_STUDENT'] < 0))
+                            ]
+                            
+                            # Replace invalid distances with a high number so they sort to the end
+                            if not invalid_distances.empty:
+                                combined_df['DISTANCE_TO_STUDENT'] = combined_df['DISTANCE_TO_STUDENT'].fillna(9999)
+                                combined_df.loc[combined_df['DISTANCE_TO_STUDENT'] < 0, 'DISTANCE_TO_STUDENT'] = 9999
+                            
+                            # Sort by distance (student first, then alumni by closest distance)
+                            combined_df = combined_df.sort_values(
+                                ['DATA_TYPE', 'DISTANCE_TO_STUDENT'], 
+                                ascending=[False, True]
+                            ).reset_index(drop=True)
+                    else:
+                        combined_df['DISTANCE_TO_STUDENT'] = None
+                else:
+                    # No distance calculation needed
+                    combined_df['DISTANCE_TO_STUDENT'] = None
+                
+                alumni_count = combined_df[combined_df['DATA_TYPE']=='Alumni'].shape[0]
+                student_count = combined_df[combined_df['DATA_TYPE']=='Student'].shape[0]
+                
+                if selected_student != "All Students" and student_count == 1:
+                    # Find closest alumni with valid coordinates
+                    closest_alumni = combined_df[
+                        (combined_df['DATA_TYPE'] == 'Alumni') & 
+                        (combined_df['DISTANCE_TO_STUDENT'].notna()) &
+                        (combined_df['DISTANCE_TO_STUDENT'] < 9999)
+                    ].head(1)
+                    
+                    st.success(f"📊 Focused View: **{alumni_count:,} alumni** + **1 selected student** ({selected_student}) = **{len(combined_df):,} total records**")
+                    
+                    if not closest_alumni.empty:
+                        closest_distance = closest_alumni.iloc[0]['DISTANCE_TO_STUDENT']
+                        st.info(f"🎯 Alumni sorted by distance • **Closest:** {closest_distance:.1f} miles away")
+                else:
+                    st.success(f"📊 Combined View: {len(combined_df)} total records ({alumni_count} alumni, {student_count} students)")
+                
+                # Display the map using our working approaches
+                if combined_map_type == "H3 Hexagonal Grid":
+                    result = create_h3_hexagon_map(combined_df, combined_h3_resolution)
+                else:
+                    result = create_combined_point_map(combined_df)
+                
+                if result is not None:
+                    # Check if it's a PyDeck deck or Plotly figure
+                    if hasattr(result, 'layers'):  # PyDeck deck
+                        st.pydeck_chart(result)
+                    else:  # Plotly figure
+                        st.plotly_chart(result, use_container_width=True)
+                        
+                    # Map legend
+                    with st.expander("🗺️ Map Legend", expanded=True):
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.write("**🔴 Red:** Major Donors")
+                            st.write("**🟠 Orange:** Mid-Level Donors") 
+                            st.write("**🟢 Green:** Annual Donors")
+                        
+                        with col2:
+                            st.write("**🔵 Blue:** Enrolled Students")
+                            st.write("**🟡 Light Blue:** Prospective Students")
+                        
+                        with col3:
+                            st.write("**📍 Click Points:** View Details")
+                            st.write("**🎯 Purpose:** Geographic Overview")
+                else:
+                    st.error("Unable to create combined map visualization.")
+                
+                # Combined data table section
+                if combined_data:
+                    st.markdown("---")
+                    if selected_student != "All Students":
+                        st.markdown(f"### 📋 Data Table: {selected_student} + All Alumni")
+                    else:
+                        st.markdown("### 📋 Combined Data Table")
+                    
+                    # Display options
+                    col_table1, col_table2 = st.columns([1, 3])
+                    with col_table1:
+                        show_combined_records = st.selectbox(
+                            "Records to display:",
+                            [25, 50, 100, "All"],
+                            index=0,
+                            key="combined_show_records"
+                        )
+                    
+                    # Apply display limit
+                    if show_combined_records == "All":
+                        display_combined_df = combined_df
+                    else:
+                        display_combined_df = combined_df.head(show_combined_records)
+                    
+                    # Create table with common fields that exist in both datasets
+                    table_data = []
+                    for _, row in display_combined_df.iterrows():
+                        table_row = {
+                            'Name': row.get('PERSON_NAME', 'Unknown'),
+                            'Type': row.get('DATA_TYPE', 'Unknown'),
+                            'Status/Segment': row.get('STATUS_OR_SEGMENT', 'Unknown'),
+                            'Major': row.get('MAJOR', 'Unknown'),
+                            'Street Address': row.get('STREET_ADDRESS', 'N/A'),
+                            'City': row.get('CITY', 'N/A'),
+                            'State': row.get('STATE', 'N/A'),
+                            'Zip Code': row.get('ZIP_CODE', 'Unknown')
+                        }
+                        
+                        # Add distance column if a student is selected
+                        if selected_student != "All Students" and row.get('DISTANCE_TO_STUDENT') is not None:
+                            if row.get('DATA_TYPE') == 'Alumni':
+                                distance = row.get('DISTANCE_TO_STUDENT', 0)
+                                if distance >= 9999:
+                                    table_row['Distance'] = "No coords"  # Invalid coordinates
+                                else:
+                                    table_row['Distance'] = f"{distance:.1f} mi"
+                            else:
+                                table_row['Distance'] = "Selected"  # The student themselves
+                        
+                        table_data.append(table_row)
+                    
+                    # Convert to DataFrame for display
+                    table_df = pd.DataFrame(table_data)
+                    
+                    # Dynamic column config based on whether distance is included
+                    column_config = {
+                        "Name": "Full Name",
+                        "Type": "Data Type",
+                        "Status/Segment": "Status/Donor Segment",
+                        "Major": "Major/Field of Study",
+                        "Street Address": "Street Address",
+                        "City": "City",
+                        "State": "State",
+                        "Zip Code": "Zip Code"
+                    }
+                    
+                    # Add distance column config if it exists
+                    if selected_student != "All Students" and 'Distance' in table_df.columns:
+                        column_config["Distance"] = st.column_config.TextColumn(
+                            "Distance from Student",
+                            help=f"Distance from {selected_student}",
+                            width="small"
+                        )
+                    
+                    st.dataframe(
+                        table_df,
+                        use_container_width=True,
+                        height=400,
+                        column_config=column_config
+                    )
+                    
+                    # Download combined data
+                    col_download1, col_download2 = st.columns(2)
+                    with col_download1:
+                        csv_combined_data = table_df.to_csv(index=False).encode('utf-8')
+                        
+                        # Dynamic filename based on whether student is selected
+                        if selected_student != "All Students":
+                            filename = f"alumni_near_{selected_student.replace(' ', '_')}_{len(table_df)}_records.csv"
+                            help_text = f"Alumni sorted by distance from {selected_student}"
+                        else:
+                            filename = f"combined_alumni_students_{len(table_df)}_records.csv"
+                            help_text = "Combined dataset with common fields"
+                        
+                        st.download_button(
+                            label="📥 Download Combined Data",
+                            data=csv_combined_data,
+                            file_name=filename,
+                            mime="text/csv",
+                            help=help_text
+                        )
+                    
+                    if show_combined_records != "All" and len(combined_df) > show_combined_records:
+                        st.info(f"Showing first {show_combined_records} of {len(combined_df)} combined records. Use download button to get complete data.")
+            else:
+                st.warning("Please select at least one data type to display.")
+        else:
+            st.warning("Both alumni and student data are required for combined view. Apply filters in the Alumni and Student tabs first.")
+    
+    with tab4:
+        st.markdown('<h3 class="sub-header">Analytics Dashboard</h3>', 
+                   unsafe_allow_html=True)
+        
+        if not alumni_df.empty:
+            current_alumni = filtered_alumni if 'filtered_alumni' in locals() else alumni_df
+            current_students = filtered_students if 'filtered_students' in locals() and not student_df.empty else student_df
+            current_matches = st.session_state.get('matches_df', pd.DataFrame())
+            
+            charts = create_analytics_charts(current_alumni, current_students, current_matches)
+            
+            # Display charts in grid
+            for i in range(0, len(charts), 2):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if i < len(charts):
+                        st.plotly_chart(charts[i][1], use_container_width=True)
+                
+                with col2:
+                    if i + 1 < len(charts):
+                        st.plotly_chart(charts[i + 1][1], use_container_width=True)
+        else:
+            st.warning("No data available for analytics.")
+
+if __name__ == "__main__":
+    main()
