@@ -1,4 +1,11 @@
 Builds off - DEMO_HIGHER_ED_DONOR_TARGETING_GEO
 
 
- 
+Streamlit packaages:
+plotly - 6.3.0
+pydeck - 0.9.1
+snowflake-snowpark-python - latest
+streamlit - latest
+
+
+
